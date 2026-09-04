@@ -135,9 +135,11 @@ def _make_hermes_provider_class() -> Optional[type]:
             server_name: str = "",
             preregistered: bool = False,
             token_user_agent: "str | None" = None,
+            extra_auth_params: "dict[str, str] | None" = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
+            self._hermes_extra_auth_params: dict[str, str] = extra_auth_params or {}
             # mcp 2.0.0 uses a task-owned anyio.Lock and holds it across the
             # yielded resource request.  A session-long GET therefore blocks
             # every concurrent POST, and HTTPX may later close the auth-flow
@@ -198,8 +200,91 @@ def _make_hermes_provider_class() -> Optional[type]:
             request = await super()._refresh_token()
             return self._stamp_token_user_agent(request)
 
+        async def _perform_authorization_code_grant(self) -> "tuple[str, str]":
+            """Build the SDK authorization request with provider-specific extras.
+
+            This is the manager-path equivalent of the legacy provider override
+            from PR #93342.  The MCP SDK 2.x provider does not accept an
+            ``extra_auth_params`` constructor argument, so the parameters must
+            be held by this subclass and merged at the authorization boundary.
+            Standard OAuth/PKCE parameters are constructed here and cannot be
+            replaced by the provider-specific mapping.
+            """
+            import secrets as _secrets
+            from urllib.parse import urlencode
+
+            from mcp.client.auth.oauth2 import OAuthFlowError, PKCEParameters
+
+            if self.context.client_metadata.redirect_uris is None:
+                raise OAuthFlowError("No redirect URIs provided for authorization code grant")
+
+            if (
+                self.context.oauth_metadata
+                and self.context.oauth_metadata.authorization_endpoint
+            ):
+                auth_endpoint = str(self.context.oauth_metadata.authorization_endpoint)
+            else:
+                auth_base_url = self.context.get_authorization_base_url(
+                    self.context.server_url
+                )
+                auth_endpoint = f"{auth_base_url}/authorize"
+
+            if not self.context.client_info:
+                raise OAuthFlowError("No client info available for authorization")
+
+            pkce_params = PKCEParameters.generate()
+            state = _secrets.token_urlsafe(32)
+            auth_params: dict[str, str] = {
+                "response_type": "code",
+                "client_id": self.context.client_info.client_id,
+                "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
+                "state": state,
+                "code_challenge": pkce_params.code_challenge,
+                "code_challenge_method": "S256",
+            }
+
+            if self.context.should_include_resource_param(self.context.protocol_version):
+                auth_params["resource"] = self.context.get_resource_url()
+
+            if self.context.client_metadata.scope:
+                auth_params["scope"] = self.context.client_metadata.scope
+                if "offline_access" in self.context.client_metadata.scope.split():
+                    auth_params["prompt"] = "consent"
+
+            # Provider-specific extras must not override OAuth/PKCE security fields.
+            reserved = {
+                "response_type", "client_id", "redirect_uri", "state",
+                "code_challenge", "code_challenge_method", "resource", "scope",
+            }
+            auth_params.update(
+                (key, value)
+                for key, value in self._hermes_extra_auth_params.items()
+                if key not in reserved
+            )
+            authorization_url = f"{auth_endpoint}?{urlencode(auth_params)}"
+            await self.context.redirect_handler(authorization_url)
+            result = await self.context.callback_handler()
+
+            if result.state is None or not _secrets.compare_digest(result.state, state):
+                raise OAuthFlowError(
+                    f"State parameter mismatch: {result.state} != {state}"
+                )
+
+            from mcp.client.auth.oauth2 import validate_authorization_response_iss
+            validate_authorization_response_iss(result.iss, self.context.oauth_metadata)
+            return result.code, pkce_params.code_verifier
+
+        def _preserve_refresh_token(self, token_response):
+            """Retain an existing refresh token when a provider omits one."""
+            previous = getattr(self.context, "current_tokens", None)
+            previous_refresh = getattr(previous, "refresh_token", None)
+            if getattr(token_response, "refresh_token", None) is None and previous_refresh:
+                token_response.refresh_token = previous_refresh
+                logger.info("MCP OAuth '%s': refresh response omitted refresh_token; carried existing token forward", self._hermes_server_name)
+            return token_response
+
         async def _handle_token_response(self, response):
-            """Accept any 2xx token response and avoid leaking token bodies in errors."""
+            """Accept any 2xx token response and avoid leaking token bodies."""
             if 200 <= response.status_code < 300:
                 from mcp.client.auth.utils import handle_token_response_scopes
                 from mcp.client.auth.oauth2 import OAuthTokenError
@@ -209,6 +294,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                     token_response = await handle_token_response_scopes(response)
                 except (HTTPError, OAuthTokenError):
                     raise OAuthTokenError("Invalid token response") from None
+                token_response = self._preserve_refresh_token(token_response)
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
@@ -232,6 +318,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             try:
                 content = await response.aread()
                 token_response = OAuthToken.model_validate_json(content)
+                token_response = self._preserve_refresh_token(token_response)
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
                 await self.context.storage.set_tokens(token_response)
