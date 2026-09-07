@@ -119,6 +119,34 @@ def test_hosted_auth_allows_same_server_name_in_different_profiles(tmp_path, mon
 
 
 
+def test_hosted_callback_forwards_iss_query_param():
+    """The /api/mcp/oauth/callback route must forward iss= to deliver_callback."""
+    import asyncio
+
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-iss",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/reports",
+    )
+    asyncio.run(
+        flow.publish_authorization_url("https://idp.example/authorize?state=iss-state")
+    )
+    _web_server_mcp._mcp_oauth_flows[flow.flow_id] = flow
+
+    response = _client().get(
+        "/api/mcp/oauth/callback/reports"
+        "?code=iss-code&state=iss-state&iss=https%3A%2F%2Faccounts.google.com"
+    )
+
+    assert response.status_code == 200
+    assert flow._callback == ("iss-code", "iss-state")
+    assert flow.callback_iss == "https://accounts.google.com"
+
+
 def test_flow_status_does_not_expose_authorization_code():
     from hermes_cli import web_server
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow

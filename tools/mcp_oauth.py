@@ -643,7 +643,8 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
             # Dashboard flow speaks the legacy tuple; normalize to one shape.
-            return _authorization_code_result(*await dashboard_flow.wait_for_callback())
+            dash_code, dash_state = await dashboard_flow.wait_for_callback()
+            return _authorization_code_result(dash_code, dash_state, dashboard_flow.callback_iss)
         # The SDK entered the authorization-code flow, so any cached token is unusable. Reject BEFORE
         # binding: binding would block for the full timeout and collide with the TIME_WAIT port on retry.
         # Reject before binding the callback listener in non-interactive contexts. Reaching here means the

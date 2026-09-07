@@ -229,3 +229,54 @@ def test_deliver_callback_propagates_provider_error():
     import asyncio
 
     asyncio.run(_check())
+
+
+# ---------------------------------------------------------------------------
+# TUI gateway loopback listener parses and forwards iss
+# ---------------------------------------------------------------------------
+
+
+def test_deliver_callback_flow_forwards_iss():
+    """deliver_callback_flow (remote desktop relay) must forward iss to the flow."""
+    flow = _make_session(session_id="sess-relay-iss", server="hosp2", state="issstate")
+    out = deliver_callback_flow(
+        "sess-relay-iss", "hosp2", code="issabc", state="issstate", iss="https://accounts.google.com"
+    )
+    assert out == {"ok": True, "session_id": "sess-relay-iss"}
+    assert flow.callback_iss == "https://accounts.google.com"
+
+
+def test_loopback_listener_forwards_iss(monkeypatch):
+    """The gateway's local loopback HTTP listener must parse ``iss`` from the
+    callback query string and pass it to ``deliver_callback``."""
+    import asyncio
+    import urllib.request
+
+    from tui_gateway.mcp_oauth_sessions import _start_loopback_listener
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-listener-iss",
+        server_name="testserver",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="",
+    )
+    asyncio.run(
+        flow.publish_authorization_url(
+            "https://as.example.com/authorize?state=lststate"
+        )
+    )
+    httpd = _start_loopback_listener(flow)
+    port = httpd.server_address[1]
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/callback"
+            "?code=lstcode&state=lststate&iss=https%3A%2F%2Faccounts.google.com",
+            timeout=5,
+        )
+    except Exception:
+        pass  # response body doesn't matter — we only care that deliver_callback was called
+    flow._callback_ready.wait(2)
+
+    assert flow._callback == ("lstcode", "lststate")
+    assert flow.callback_iss == "https://accounts.google.com"

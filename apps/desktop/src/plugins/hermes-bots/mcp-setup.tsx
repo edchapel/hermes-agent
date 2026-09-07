@@ -363,7 +363,8 @@ export function McpSetupButton({ profile, entry, onDone, ensureProfile }: McpSet
           session_id: sessionId,
           code: cb.code || undefined,
           state: cb.state || undefined,
-          error: cb.error || undefined
+          error: cb.error || undefined,
+          iss: cb.iss || undefined
         })
 
         const rp = relay.result && (relay.result.result || relay.result)

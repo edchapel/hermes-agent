@@ -44,6 +44,7 @@ class DashboardOAuthFlow:
     tools: list[dict] = field(default_factory=list)
     expected_state: str | None = field(default=None, init=False)
     _callback: tuple[str, str | None] | None = field(default=None, init=False, repr=False)
+    callback_iss: str | None = field(default=None, init=False)
     _callback_error: str | None = field(default=None, init=False, repr=False)
     _authorization_ready: threading.Event = _event_field()
     _callback_ready: threading.Event = _event_field()
@@ -70,7 +71,7 @@ class DashboardOAuthFlow:
             raise RuntimeError(self.error or "MCP OAuth flow ended before authorization")
         return self.authorization_url
 
-    def deliver_callback(self, *, code: str | None, state: str | None, error: str | None) -> None:
+    def deliver_callback(self, *, code: str | None, state: str | None, error: str | None, iss: str | None = None) -> None:
         """Hand the browser redirect to the waiting flow; ``state`` must match exactly."""
         with self._lock:
             if self._callback_ready.is_set():
@@ -81,6 +82,7 @@ class DashboardOAuthFlow:
                 self._callback_error = error
             elif code:
                 self._callback = (code, state)
+                self.callback_iss = iss
             else:
                 self._callback_error = "OAuth callback did not include code or error"
             self._callback_ready.set()

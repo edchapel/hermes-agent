@@ -112,3 +112,23 @@ test('wait times out when no callback arrives', async () => {
   assert.equal(result.code, null)
   assert.match(String(result.error), /timeout/)
 })
+
+test('RFC 9207 iss param is forwarded alongside code and state', async () => {
+  const { id, redirectUri } = (await invoke('hermes:mcp-oauth:listen')) as { id: string; redirectUri: string }
+
+  const waitPromise = invoke('hermes:mcp-oauth:wait', id, 5000) as Promise<{
+    code: null | string
+    error: null | string
+    iss: null | string
+    state: null | string
+  }>
+
+  await fetch(`${redirectUri}?code=iss-code&state=iss-state&iss=https%3A%2F%2Faccounts.google.com`)
+
+  const result = await waitPromise
+
+  assert.equal(result.code, 'iss-code')
+  assert.equal(result.state, 'iss-state')
+  assert.equal(result.iss, 'https://accounts.google.com')
+  assert.equal(result.error, null)
+})
