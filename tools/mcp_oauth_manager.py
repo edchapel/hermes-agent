@@ -124,6 +124,7 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     self.context.protected_resource_metadata = prm
                     if prm.authorization_servers:
                         self.context.auth_server_url = str(prm.authorization_servers[0])
+                        self._normalize_auth_server_url()
                     break
             # ASM discovery against auth_server_url (server_url fallback for legacy providers).
             for url in build_oauth_authorization_server_metadata_discovery_urls(self.context.auth_server_url, server_url):
@@ -201,6 +202,20 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             self._initialized = False
         except Exception as exc:  # pragma: no cover — must not throw
             self._log_nonfatal("invalid_client detection", exc)
+
+    def _normalize_auth_server_url(self) -> None:
+        """Google's PRM lists ``https://accounts.google.com/`` while its AS metadata issuer
+        is ``https://accounts.google.com``; the SDK compares them as plain strings (RFC 8414
+        §3.3), so strip the trailing slash of a bare http/https origin before validation.
+        Only normalizes when path is exactly ``/`` with no query and no fragment."""
+        url = self.context.auth_server_url
+        if not url or not url.endswith("/"):
+            return
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if (parsed.scheme in {"http", "https"} and parsed.netloc
+                and parsed.path == "/" and not parsed.query and not parsed.fragment):
+            self.context.auth_server_url = url[:-1]
 
     def _needs_forced_authorization(self, request, outgoing, incoming) -> bool:
         """True when the server answered the unauthenticated MCP request with 2xx and no token
@@ -280,6 +295,7 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 # original unauthenticated request, no valid token, and no Authorization header sent.
                 if self._needs_forced_authorization(request, outgoing, incoming):
                     incoming = self._synthetic_unauthorized(incoming)
+                self._normalize_auth_server_url()
                 outgoing = await inner.asend(incoming)
         except StopAsyncIteration:
             self._persist_oauth_metadata_if_changed()  # metadata discovered lazily in the 401 branch

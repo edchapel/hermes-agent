@@ -150,3 +150,93 @@ class TestManagerOAuthProviderMetadata:
         loaded = storage.load_oauth_metadata()
         assert loaded is not None
         assert str(loaded.token_endpoint) == "https://flow.example.com/token"
+
+
+# ---------------------------------------------------------------------------
+# Bare-origin trailing-slash normalization in the pre-flight discovery path
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeAuthServerUrl:
+    """Unit tests for HermesMCPOAuthProvider._normalize_auth_server_url.
+
+    The normalization helper strips a trailing slash from a bare-origin http/https
+    URL (path exactly '/') so the MCP SDK's string-equality issuer check succeeds
+    when PRM and ASM spell the same origin differently.
+    """
+
+    def _provider_with_url(self, url):
+        if _HERMES_PROVIDER_CLS is None:
+            pytest.skip("MCP SDK auth not available")
+        provider = _HERMES_PROVIDER_CLS.__new__(_HERMES_PROVIDER_CLS)
+        provider._hermes_server_name = "test"
+        context = MagicMock()
+        context.auth_server_url = url
+        provider.context = context
+        return provider
+
+    def test_bare_origin_https_slash_stripped(self):
+        """https://accounts.google.com/ → https://accounts.google.com"""
+        p = self._provider_with_url("https://accounts.google.com/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://accounts.google.com"
+
+    def test_bare_origin_http_slash_stripped(self):
+        """http://localhost/ → http://localhost"""
+        p = self._provider_with_url("http://localhost/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "http://localhost"
+
+    def test_bare_origin_with_port_slash_stripped(self):
+        """https://auth.example.com:8080/ → https://auth.example.com:8080"""
+        p = self._provider_with_url("https://auth.example.com:8080/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://auth.example.com:8080"
+
+    def test_no_slash_unchanged(self):
+        """https://accounts.google.com (no slash) is unchanged."""
+        p = self._provider_with_url("https://accounts.google.com")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://accounts.google.com"
+
+    def test_path_bearing_url_not_normalized(self):
+        """https://idp.example.com/tenant/ has path /tenant/ — must not be touched."""
+        p = self._provider_with_url("https://idp.example.com/tenant/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://idp.example.com/tenant/"
+
+    def test_url_with_query_not_normalized(self):
+        """A URL with query string must not be altered."""
+        p = self._provider_with_url("https://accounts.example.com/?realm=corp")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://accounts.example.com/?realm=corp"
+
+    def test_url_with_fragment_not_normalized(self):
+        """A URL with a fragment must not be altered."""
+        p = self._provider_with_url("https://accounts.example.com/#section")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https://accounts.example.com/#section"
+
+    def test_none_url_no_error(self):
+        """None auth_server_url must not raise."""
+        p = self._provider_with_url(None)
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url is None
+
+    def test_empty_url_no_error(self):
+        """Empty-string auth_server_url must not raise."""
+        p = self._provider_with_url("")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == ""
+
+    def test_non_http_scheme_not_normalized(self):
+        """ftp://auth.example.com/ must not be touched (scheme is not http/https)."""
+        p = self._provider_with_url("ftp://auth.example.com/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "ftp://auth.example.com/"
+
+    def test_no_authority_https_not_normalized(self):
+        """https:/ (no netloc/authority) must not be touched."""
+        p = self._provider_with_url("https:/")
+        p._normalize_auth_server_url()
+        assert p.context.auth_server_url == "https:/"
