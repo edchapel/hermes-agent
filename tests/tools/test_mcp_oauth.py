@@ -1143,3 +1143,281 @@ def test_humanize_non_registration_403_passthrough():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# oauth.extra_auth_params — generic user-configured authorization extras
+# (Task 7: guarded extra_auth_params, PR #93342 semantic port)
+# ---------------------------------------------------------------------------
+
+class TestExtraAuthParams:
+    """User-configured oauth.extra_auth_params appear in the authorization URL
+    while canonical OAuth/PKCE fields stay controlled by the SDK override."""
+
+    def _build_provider(self, tmp_path, monkeypatch, oauth_config=None):
+        pytest.importorskip("mcp.client.auth")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        return build_oauth_auth(
+            "extra-params-server",
+            "https://mcp.example.com/mcp",
+            oauth_config or {},
+        )
+
+    def _captured_auth_url(self, provider, monkeypatch):
+        """Run _perform_authorization_code_grant and capture the authorization URL
+        that would be passed to redirect_handler, without actually opening a browser."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        captured = {}
+        fake_result = MagicMock()
+        fake_result.state = None  # force state compare to use a captured value
+
+        async def capture_redirect(url):
+            captured["url"] = url
+
+        async def fake_callback():
+            import secrets
+            # Return a matching state so the flow doesn't fail on mismatch.
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(captured["url"]).query)
+            state = qs.get("state", [None])[0]
+            from mcp.shared.auth import AuthorizationCodeResult
+            return AuthorizationCodeResult(code="code123", state=state, iss=None)
+
+        provider.context.redirect_handler = capture_redirect
+        provider.context.callback_handler = fake_callback
+
+        # Provide minimal client_info so the method can build the URL.
+        from mcp.shared.auth import OAuthClientInformationFull
+        provider.context.client_info = OAuthClientInformationFull.model_validate({
+            "client_id": "test-client-id",
+            "redirect_uris": [str(provider.context.client_metadata.redirect_uris[0])],
+        })
+
+        asyncio.run(provider._perform_authorization_code_grant())
+        return captured.get("url", "")
+
+    def test_safe_extra_appears_in_authorization_url(self, tmp_path, monkeypatch):
+        """A configured safe extra (access_type=offline) reaches the auth URL."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch, {"extra_auth_params": {"access_type": "offline"}}
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "access_type=offline" in url
+
+    def test_extra_does_not_displace_canonical_client_id(self, tmp_path, monkeypatch):
+        """Standard client_id in the URL comes from the SDK, not extras."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch, {"extra_auth_params": {"access_type": "offline"}}
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "client_id=test-client-id" in url
+
+    def test_extra_does_not_displace_canonical_state(self, tmp_path, monkeypatch):
+        """State in the URL is the one the SDK generated, not an extras override."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch, {"extra_auth_params": {"access_type": "offline"}}
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(url).query)
+        # state must be present and non-empty; the callback matched it so the method completed.
+        assert qs.get("state") and qs["state"][0]
+
+    def test_pkce_fields_present(self, tmp_path, monkeypatch):
+        """PKCE code_challenge and code_challenge_method must be in the URL."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch, {"extra_auth_params": {"access_type": "offline"}}
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "code_challenge=" in url
+        assert "code_challenge_method=S256" in url
+
+    def test_no_extras_preserves_upstream_url_behavior(self, tmp_path, monkeypatch):
+        """Absence of extras produces a standard authorization URL."""
+        provider = self._build_provider(tmp_path, monkeypatch, {})
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "response_type=code" in url
+        assert "client_id=" in url
+        assert "code_challenge=" in url
+        # No unexpected extra params injected.
+        assert "access_type" not in url
+
+    @pytest.mark.parametrize("denied_key", [
+        "response_type",
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "scope",
+        "resource",
+        "prompt",
+        "iss",
+    ])
+    def test_denylisted_key_excluded_from_url(self, tmp_path, monkeypatch, denied_key):
+        """Each standard OAuth parameter is rejected and does not appear as an extra."""
+        sentinel = "INJECTED_SENTINEL_VALUE"
+        provider = self._build_provider(
+            tmp_path, monkeypatch, {"extra_auth_params": {denied_key: sentinel}}
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        # The sentinel value must never appear (the key may legitimately appear with SDK value).
+        assert sentinel not in url
+
+    def test_denied_key_mixed_case_excluded(self, tmp_path, monkeypatch):
+        """Denylist check is case-insensitive (Response_Type, CLIENT_ID, etc.)."""
+        sentinel = "SENTINEL_MIXED"
+        provider = self._build_provider(
+            tmp_path, monkeypatch,
+            {"extra_auth_params": {"Response_Type": sentinel, "CLIENT_ID": sentinel}},
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert sentinel not in url
+
+    def test_malformed_non_string_keys_excluded(self, tmp_path, monkeypatch):
+        """Non-string or empty keys/values are silently excluded."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch,
+            {"extra_auth_params": {"": "v", "k": "", "good_key": "good_value"}},
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "good_key=good_value" in url
+
+    def test_nested_dict_value_excluded(self, tmp_path, monkeypatch):
+        """A nested dict value (non-string) is excluded safely."""
+        provider = self._build_provider(
+            tmp_path, monkeypatch,
+            {"extra_auth_params": {"nested": {"inner": "val"}, "safe_key": "safe_val"}},
+        )
+        assert provider is not None
+        url = self._captured_auth_url(provider, monkeypatch)
+        assert "safe_key=safe_val" in url
+        assert "nested" not in url
+
+
+class TestExtraAuthParamsManagerPath:
+    """Manager (HermesMCPOAuthProvider) also receives extra_auth_params."""
+
+    def test_manager_provider_receives_extra_auth_params(self, tmp_path, monkeypatch):
+        """Manager-built provider has _hermes_extra_auth_params populated."""
+        pytest.importorskip("mcp.client.auth")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+
+        from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+        reset_manager_for_tests()
+        manager = MCPOAuthManager()
+        provider = manager.get_or_build_provider(
+            "mgr-extras",
+            "https://mcp.example.com/mcp",
+            {"extra_auth_params": {"access_type": "offline"}},
+        )
+        assert provider is not None
+        assert getattr(provider, "_hermes_extra_auth_params", None) == {"access_type": "offline"}
+
+    def test_manager_provider_extra_in_auth_url(self, tmp_path, monkeypatch):
+        """Manager provider's _perform_authorization_code_grant merges extras."""
+        pytest.importorskip("mcp.client.auth")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+
+        from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+        from mcp.shared.auth import OAuthClientInformationFull, AuthorizationCodeResult
+        import asyncio
+
+        reset_manager_for_tests()
+        manager = MCPOAuthManager()
+        provider = manager.get_or_build_provider(
+            "mgr-extras-url",
+            "https://mcp.example.com/mcp",
+            {"extra_auth_params": {"access_type": "offline"}},
+        )
+        assert provider is not None
+
+        captured = {}
+
+        async def capture_redirect(url):
+            captured["url"] = url
+
+        async def fake_callback():
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(captured["url"]).query)
+            state = qs.get("state", [None])[0]
+            return AuthorizationCodeResult(code="code123", state=state, iss=None)
+
+        provider.context.redirect_handler = capture_redirect
+        provider.context.callback_handler = fake_callback
+        provider.context.client_info = OAuthClientInformationFull.model_validate({
+            "client_id": "mgr-client-id",
+            "redirect_uris": [str(provider.context.client_metadata.redirect_uris[0])],
+        })
+
+        asyncio.run(provider._perform_authorization_code_grant())
+        url = captured.get("url", "")
+        assert "access_type=offline" in url
+        assert "client_id=mgr-client-id" in url
+
+
+class TestExtraAuthParamsSanitizer:
+    """Direct unit tests for _sanitize_extra_auth_params covering reviewer findings."""
+
+    def _sanitize(self, raw, caplog=None):
+        from tools.mcp_oauth_provider import _sanitize_extra_auth_params
+        import logging
+        log = logging.getLogger("test.sanitizer")
+        return _sanitize_extra_auth_params(raw, warn_logger=log)
+
+    # --- Item 1: Mapping-compatible input (not only dict) ---
+
+    def test_mapping_proxy_type_accepted(self):
+        """MappingProxyType (a non-dict Mapping) should pass through valid entries."""
+        from types import MappingProxyType
+        raw = MappingProxyType({"access_type": "offline"})
+        result = self._sanitize(raw)
+        assert result == {"access_type": "offline"}
+
+    # --- Item 2: Warning names rejected key but does not contain the value ---
+
+    def test_denied_key_warning_names_key_not_value(self, caplog):
+        """Warning for a denylist key must include the key name but not the rejected value."""
+        import logging
+        from tools.mcp_oauth_provider import _sanitize_extra_auth_params
+        secret_value = "SECRET_SHOULD_NOT_APPEAR"
+        with caplog.at_level(logging.WARNING, logger="tools.mcp_oauth_provider"):
+            _sanitize_extra_auth_params(
+                {"response_type": secret_value},
+                warn_logger=logging.getLogger("tools.mcp_oauth_provider"),
+            )
+        assert any("response_type" in r.message for r in caplog.records)
+        assert not any(secret_value in r.message for r in caplog.records)
+
+    # --- Item 3: build_provider_kwargs omits key when all entries invalid/denied ---
+
+    def test_build_provider_kwargs_omits_extra_auth_params_when_all_invalid(
+        self, tmp_path, monkeypatch
+    ):
+        """build_provider_kwargs must not pass extra_auth_params when every entry is filtered."""
+        pytest.importorskip("mcp.client.auth")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        from tools.mcp_oauth import HermesTokenStorage
+        from tools.mcp_oauth_provider import build_provider_kwargs, prepare_oauth_config
+        cfg, storage = prepare_oauth_config(
+            "test-server",
+            "https://mcp.example.com/mcp",
+            # All entries are denied (standard OAuth params) or invalid (empty key/value).
+            {"extra_auth_params": {"response_type": "code", "": "bad", "client_id": "evil"}},
+        )
+        kwargs = build_provider_kwargs(cfg, storage, ssh_proxy_hint=False)
+        assert "extra_auth_params" not in kwargs

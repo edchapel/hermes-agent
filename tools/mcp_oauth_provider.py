@@ -15,6 +15,41 @@ if TYPE_CHECKING:
     from tools.mcp_oauth import HermesTokenStorage
 logger = logging.getLogger(__name__)
 
+# Standard OAuth/PKCE parameters that user-supplied extras must not shadow.
+# Case-insensitive comparison is applied at validation time (keys are lowercased).
+_STANDARD_OAUTH_PARAMS = frozenset({
+    "response_type", "client_id", "redirect_uri", "state",
+    "code_challenge", "code_challenge_method", "scope", "resource",
+    "prompt", "iss",
+})
+
+
+def _sanitize_extra_auth_params(raw: Any, *, warn_logger: logging.Logger) -> dict[str, str]:
+    """Return a sanitized copy of user-supplied extra auth params.
+
+    Rules:
+    - Input must be a Mapping; non-mappings return {}.
+    - Keys and values must be non-empty strings; invalid entries are silently dropped.
+    - Keys matching the standard OAuth denylist (case-insensitive) are dropped with a
+      warning (key name only — no value logged).
+    """
+    from collections.abc import Mapping
+    if not isinstance(raw, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if not isinstance(value, str) or not value:
+            continue
+        if key.lower() in _STANDARD_OAUTH_PARAMS:
+            warn_logger.warning(
+                "oauth.extra_auth_params: ignoring %r — shadows a standard OAuth parameter", key
+            )
+            continue
+        result[key] = value
+    return result
+
 
 class HermesProviderMixin:
     """Token-endpoint fixes layered over the SDK's ``OAuthClientProvider`` (must precede it in
@@ -25,15 +60,96 @@ class HermesProviderMixin:
       endpoint rejects the exchange (looping the browser page) — coerce ``client_secret_post``.
     - ``token_user_agent`` (``oauth.user_agent``) is stamped onto token-endpoint requests only
       (some authorization servers/WAFs reject httpx's default).
-    - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
+    - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs.
+    - ``extra_auth_params`` (``oauth.extra_auth_params``) merges generic key/value pairs into
+      the authorization URL after all canonical SDK fields; standard OAuth params are filtered."""
 
     _hermes_logger: logging.Logger = logger
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        token_user_agent: str | None = None,
+        extra_auth_params: dict[str, str] | None = None,
+        **kwargs: Any,
+    ):
         super().__init__(*args, **kwargs)
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
+        self._hermes_extra_auth_params: dict[str, str] = extra_auth_params or {}
+
+    async def _perform_authorization_code_grant(self) -> "tuple[str, str]":
+        """Mirrors the pinned SDK implementation, merging ``_hermes_extra_auth_params`` into
+        the authorization URL after all canonical OAuth/PKCE fields are set.
+
+        This override is intentionally a near-copy of the SDK method so that extras are
+        injected at the one correct point — after canonical params are locked in and before
+        the URL is passed to redirect_handler. Standard OAuth fields (response_type, client_id,
+        etc.) remain under SDK control and cannot be replaced by extras.
+        """
+        import secrets as _secrets
+        from urllib.parse import urlencode, urljoin
+
+        from mcp.client.auth.exceptions import OAuthFlowError
+        from mcp.client.auth.oauth2 import PKCEParameters
+        from mcp.client.auth.utils import validate_authorization_response_iss
+
+        if self.context.client_metadata.redirect_uris is None:
+            raise OAuthFlowError("No redirect URIs provided for authorization code grant")
+        if not self.context.redirect_handler:
+            raise OAuthFlowError("No redirect handler provided for authorization code grant")
+        if not self.context.callback_handler:
+            raise OAuthFlowError("No callback handler provided for authorization code grant")
+
+        if self.context.oauth_metadata and self.context.oauth_metadata.authorization_endpoint:
+            auth_endpoint = str(self.context.oauth_metadata.authorization_endpoint)
+        else:
+            auth_base_url = self.context.get_authorization_base_url(self.context.server_url)
+            auth_endpoint = urljoin(auth_base_url, "/authorize")
+
+        if not self.context.client_info:
+            raise OAuthFlowError("No client info available for authorization")
+
+        pkce_params = PKCEParameters.generate()
+        state = _secrets.token_urlsafe(32)
+
+        auth_params: dict[str, str] = {
+            "response_type": "code",
+            "client_id": self.context.client_info.client_id,
+            "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
+            "state": state,
+            "code_challenge": pkce_params.code_challenge,
+            "code_challenge_method": "S256",
+        }
+
+        if self.context.should_include_resource_param(self.context.protocol_version):
+            auth_params["resource"] = self.context.get_resource_url()
+
+        if self.context.client_metadata.scope:
+            auth_params["scope"] = self.context.client_metadata.scope
+            if "offline_access" in self.context.client_metadata.scope.split():
+                auth_params["prompt"] = "consent"
+
+        # Merge provider-specific extras AFTER canonical fields so they cannot shadow them.
+        extras = getattr(self, "_hermes_extra_auth_params", None) or {}
+        if extras:
+            auth_params.update(extras)
+
+        authorization_url = f"{auth_endpoint}?{urlencode(auth_params)}"
+        await self.context.redirect_handler(authorization_url)
+
+        result = await self.context.callback_handler()
+
+        if result.state is None or not _secrets.compare_digest(result.state, state):
+            raise OAuthFlowError(f"State parameter mismatch: {result.state} != {state}")
+
+        validate_authorization_response_iss(result.iss, self.context.oauth_metadata)
+
+        if not result.code:
+            raise OAuthFlowError("No authorization code received")
+
+        return result.code, pkce_params.code_verifier
 
     def _prepare_token_request(self, request):
         """Stamp the configured User-Agent onto a token/refresh request."""
@@ -131,7 +247,8 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
     client_metadata = mo._build_client_metadata(cfg)
     mo._maybe_preregister_client(storage, cfg, client_metadata)
     redirect_uri = (cfg.get("redirect_uri") or None) if ssh_proxy_hint else None
-    return {
+    extras = _sanitize_extra_auth_params(cfg.get("extra_auth_params"), warn_logger=logger)
+    kwargs: dict[str, Any] = {
         "client_metadata": client_metadata,
         "storage": storage,
         "redirect_handler": mo._make_redirect_handler(port, redirect_uri=redirect_uri),
@@ -140,3 +257,6 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
         "callback_handler": mo._make_callback_waiter(port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))),
         "token_user_agent": mo.token_request_user_agent(cfg),
         **mo.cimd_provider_kwargs(cfg)}
+    if extras:
+        kwargs["extra_auth_params"] = extras
+    return kwargs

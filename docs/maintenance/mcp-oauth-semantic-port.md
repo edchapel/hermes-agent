@@ -30,7 +30,8 @@
 - Behavioral reference branch: `mcp-oauth-manager-keep-refresh-token` at `7e8d9a7ed9`. Do not rewrite or delete it.
 - Semantic-port branch: `mcp-oauth-manager-keep-refresh-token-upstream`, created directly from `upstream/main` at `c4a5deeffa`.
 - Ported and manually proven: RFC 6749 refresh-token carry-forward. Commit `0f22f3cf30` adds shared persistence behavior plus regression tests. A real Google Workspace refresh after forced expiry succeeded from the default Hermes profile; the stored refresh token remained present and Google rotated it.
-- Pending, each to be a separate atomic local commit: guarded 2xx-without-token authorization (`#97010`), bare-origin authorization-server trailing-slash normalization (`#97010`), RFC 9207 `iss` callback propagation across dashboard/WebUI/Desktop (`#97010`), and guarded `oauth.extra_auth_params` (`#93342`, including the later shadow guard).
+- Pending, each to be a separate atomic local commit: guarded 2xx-without-token authorization (`#97010`), bare-origin authorization-server trailing-slash normalization (`#97010`), RFC 9207 `iss` callback propagation across dashboard/WebUI/Desktop (`#97010`).
+- Ported: guarded `oauth.extra_auth_params` (`#93342`, including the later shadow guard). Commit adds `_sanitize_extra_auth_params` and `_STANDARD_OAUTH_PARAMS` to `HermesProviderMixin` in `tools/mcp_oauth_provider.py`; both `build_oauth_auth` (legacy) and manager paths receive sanitized extras via `build_provider_kwargs`.
 - Historical source commits, retained for replay and future upstream reconciliation:
   - `#97010`: `327a50c5c8` (2xx authorization), `54d55c6935` (bare-origin slash), `d4563a4e30` (RFC 9207 `iss`).
   - `#99023`: `db6bc86669`, `9508caec1c`, `ad9f8ba4f5`, `0fbd4e3007` (refresh-token persistence / client metadata).
