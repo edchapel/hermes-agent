@@ -488,3 +488,81 @@ async def test_manager_refresh_read_error_clears_tokens(tmp_path, monkeypatch):
 
     assert result is False
     assert provider.context.current_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_store_tokens_preserves_refresh_token_when_response_omits_it(
+    tmp_path, monkeypatch
+):
+    """RFC 6749 section 6: A client MUST retain the previous refresh token
+    when an OAuth token/refresh response omits one.
+
+    Regression test for the keep-refresh-token-upstream fix.
+    """
+    from mcp.shared.auth import OAuthToken
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    # Set existing cached tokens with a refresh token
+    provider.context.current_tokens = OAuthToken(
+        access_token="old-access",
+        token_type="Bearer",
+        refresh_token="old-refresh",
+    )
+
+    # New token response WITHOUT refresh_token (common for refresh responses)
+    new_token_response = OAuthToken(
+        access_token="new-access",
+        token_type="Bearer",
+        # refresh_token intentionally omitted
+    )
+
+    # Store the new token
+    await provider._store_tokens(new_token_response)
+
+    # Should retain the old refresh token
+    assert provider.context.current_tokens.refresh_token == "old-refresh"
+    # Should have the new access token
+    assert provider.context.current_tokens.access_token == "new-access"
+
+
+@pytest.mark.asyncio
+async def test_store_tokens_replaces_refresh_token_when_response_includes_new_one(
+    tmp_path, monkeypatch
+):
+    """When an OAuth response includes a new refresh_token, it should replace
+    the old one (not be preserved).
+
+    Regression test to ensure we don't blindly retain old tokens when a new
+    one is explicitly provided.
+    """
+    from mcp.shared.auth import OAuthToken
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
+    )
+
+    # Set existing cached tokens with a refresh token
+    provider.context.current_tokens = OAuthToken(
+        access_token="old-access",
+        token_type="Bearer",
+        refresh_token="old-refresh",
+    )
+
+    # New token response WITH a different refresh_token
+    new_token_response = OAuthToken(
+        access_token="new-access",
+        token_type="Bearer",
+        refresh_token="new-refresh",
+    )
+
+    # Store the new token
+    await provider._store_tokens(new_token_response)
+
+    # Should have the NEW refresh token (not the old one)
+    assert provider.context.current_tokens.refresh_token == "new-refresh"
+    assert provider.context.current_tokens.access_token == "new-access"

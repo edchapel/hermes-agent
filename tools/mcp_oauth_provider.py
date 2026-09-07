@@ -62,7 +62,19 @@ class HermesProviderMixin:
         self._coerce_client_secret_post()
         return self._prepare_token_request(await super()._refresh_token())
 
+    def _preserve_prior_refresh_token(self, token_response):
+        """RFC 6749 section 6: retain the previous refresh_token when the
+        response omits one. If token_response.refresh_token is falsy, use
+        model_copy(update=...) to inject the prior token without mutation."""
+        if token_response.refresh_token:
+            return token_response
+        prior_tokens = self.context.current_tokens
+        if not prior_tokens or not prior_tokens.refresh_token:
+            return token_response
+        return token_response.model_copy(update={"refresh_token": prior_tokens.refresh_token})
+
     async def _store_tokens(self, token_response) -> None:
+        token_response = self._preserve_prior_refresh_token(token_response)
         self.context.current_tokens = token_response
         self.context.update_token_expiry(token_response)
         await self.context.storage.set_tokens(token_response)
