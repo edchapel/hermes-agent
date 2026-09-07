@@ -202,6 +202,35 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         except Exception as exc:  # pragma: no cover — must not throw
             self._log_nonfatal("invalid_client detection", exc)
 
+    def _needs_forced_authorization(self, request, outgoing, incoming) -> bool:
+        """True when the server answered the unauthenticated MCP request with 2xx and no token
+        exists — interactive Google Workspace servers accept requests anonymously, so the SDK's
+        401-driven flow would never start. Guards: interactive mode, original request, no valid
+        token, no Authorization header on the outgoing request."""
+        from tools.mcp_oauth import _is_interactive
+        status = getattr(incoming, "status_code", None)
+        if status is None or not 200 <= status < 300:
+            return False
+        if outgoing is not request or self.context.is_token_valid():
+            return False
+        if "authorization" in (getattr(outgoing, "headers", None) or {}):
+            return False
+        if not _is_interactive():
+            return False
+        logger.info(
+            "MCP OAuth '%s': server accepted the request without a token; "
+            "forcing the authorization flow (no cached tokens)",
+            self._hermes_server_name,
+        )
+        return True
+
+    @staticmethod
+    def _synthetic_unauthorized(incoming):
+        """Build a minimal 401 that retains the original request reference for the bridge."""
+        from tools.mcp_tool import sdk_httpx
+        httpx = sdk_httpx()
+        return httpx.Response(401, request=incoming.request)
+
     async def async_auth_flow(self, request):  # type: ignore[override]
         try:  # pre-flow hook: reload from disk if it changed (non-fatal on error)
             await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
@@ -246,6 +275,11 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 # Sniff the response for a dead-client-registration signal before handing it back to the SDK
                 # (best-effort, GH#36767).
                 await self._maybe_flag_poisoned_client(incoming)
+                # Google Workspace MCP servers accept initialize/tools-list anonymously, so the
+                # SDK's 401-driven flow never starts. Feed a synthetic 401 when all of: interactive,
+                # original unauthenticated request, no valid token, and no Authorization header sent.
+                if self._needs_forced_authorization(request, outgoing, incoming):
+                    incoming = self._synthetic_unauthorized(incoming)
                 outgoing = await inner.asend(incoming)
         except StopAsyncIteration:
             self._persist_oauth_metadata_if_changed()  # metadata discovered lazily in the 401 branch
